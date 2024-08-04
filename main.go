@@ -67,6 +67,10 @@ func FocusedWindow(x *xgb.Conn) (xproto.Window, error) {
 	return active.Focus, nil
 }
 
+func FocusWindow(x *xgb.Conn, w xproto.Window) error {
+	return xproto.SetInputFocusChecked(x, xproto.InputFocusPointerRoot, w, xproto.TimeCurrentTime).Check()
+}
+
 func WindowGeometry(x *xgb.Conn, w xproto.Window) (int16, int16, uint16, uint16, error) {
 	geo, err := xproto.GetGeometry(x, xproto.Drawable(w)).Reply()
 	if err != nil {
@@ -111,7 +115,7 @@ func main() {
 	setup := xproto.Setup(x)
 	root := setup.DefaultScreen(x).Root
 
-	if err := xproto.ChangeWindowAttributesChecked(x, root, xproto.CwEventMask, []uint32{xproto.EventMaskButtonPress | xproto.EventMaskButtonRelease | xproto.EventMaskButton1Motion | xproto.EventMaskButton3Motion | xproto.EventMaskSubstructureNotify}).Check(); err != nil {
+	if err := xproto.ChangeWindowAttributesChecked(x, root, xproto.CwEventMask, []uint32{xproto.EventMaskButtonPress | xproto.EventMaskButtonRelease | xproto.EventMaskButton1Motion | xproto.EventMaskButton3Motion | xproto.EventMaskSubstructureNotify | xproto.EventMaskFocusChange}).Check(); err != nil {
 		panic(err)
 	}
 
@@ -180,6 +184,9 @@ func main() {
 				RaiseWindow(x, window)
 				focusedWindow = window
 				SetWindowBorderColor(x, focusedWindow, WindowBorderActiveColor)
+				if err := FocusWindow(x, window); err != nil {
+					fmt.Println("couldn't focus window", err)
+				}
 			}
 			action = WindowActionNone
 		case xproto.MotionNotifyEvent:
@@ -193,8 +200,6 @@ func main() {
 				dy := ev.RootY - startY
 				xproto.ConfigureWindow(x, window, xproto.ConfigWindowWidth|xproto.ConfigWindowHeight, []uint32{uint32(int16(windowWidth) + dx), uint32(int16(windowHeight) + dy)})
 			}
-		case xproto.ConfigureNotifyEvent:
-			// TODO: ???
 		case xproto.CreateNotifyEvent:
 			if err := AddWindowBorder(x, ev.Window); err != nil {
 				fmt.Println(err)
@@ -206,6 +211,12 @@ func main() {
 			if ev.Window == focusedWindow {
 				// TODO: Set focused to last focused window.
 			}
+		case xproto.FocusInEvent:
+			fmt.Println("focus in", ev.Event)
+		case xproto.FocusOutEvent:
+			fmt.Println("focus out", ev.Event)
+		default:
+			fmt.Println("unhandled", ev)
 		}
 	}
 }
