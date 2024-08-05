@@ -1,2 +1,4 @@
-github.com/jezek/xgb v1.1.1 h1:bE/r8ZZtSv7l9gk6nU0mYx51aXrvnyb44892TwSaqS4=
-github.com/jezek/xgb v1.1.1/go.mod h1:nrhwO0FX/enq75I7Y7G8iN1ubpSGZEiA3v9e9GyRFlk=
+codeberg.org/gruf/go-byteutil v1.1.2 h1:TQLZtTxTNca9xEfDIndmo7nBYxeS94nrv/9DS3Nk5Tw=
+codeberg.org/gruf/go-byteutil v1.1.2/go.mod h1:cWM3tgMCroSzqoBXUXMhvxTxYJp+TbCr6ioISRY5vSU=
+codeberg.org/gruf/go-xgb v1.2.2 h1:rg/g527IT3lIPvLypt47my/HFS5u4SOOv8BrfCjhszE=
+codeberg.org/gruf/go-xgb v1.2.2/go.mod h1:Dag+FnAuaCe9Sstvw6hYiWKXydXyEXzhGYybnhKdWNw=

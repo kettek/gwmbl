@@ -1,222 +1,349 @@
 package main
 
 import (
+	"encoding/binary"
 	"fmt"
 	"os"
 	"os/signal"
 
-	"github.com/jezek/xgb"
-	"github.com/jezek/xgb/xproto"
+	"codeberg.org/gruf/go-xgb"
+	"codeberg.org/gruf/go-xgb/pkg/icccm"
+	"codeberg.org/gruf/go-xgb/pkg/xprop"
+	"codeberg.org/gruf/go-xgb/xproto"
 )
 
-type WindowAction int
+var x *xgb.XConn
+var xprops *xprop.XPropConn
+var screen xproto.ScreenInfo
+var root xproto.Window
+var windows []*Window
+var focusedWindow Window
+var movingWindow xproto.Window
+
+func cleanup() {
+	for _, w := range windows {
+		var px, py int16
+		geo, err := xproto.GetGeometry(x, xproto.Drawable(w.container))
+		if err == nil {
+			px = geo.X
+			py = geo.Y
+		}
+		xproto.ReparentWindowUnchecked(x, w.target, root, px, py)
+		xproto.DestroyWindowUnchecked(x, w.container)
+	}
+}
+
+func eccmName(w xproto.Window) (string, error) {
+	reply, err := xprops.GetPropName(w, "_NET_WM_NAME")
+	if err != nil {
+		return "", err
+	}
+	return xprop.PropValStr(reply)
+}
+
+type WindowType string
 
 const (
-	WindowActionNone WindowAction = iota
-	WindowActionMove
-	WindowActionResize
+	WindowTypeDesktop      WindowType = "_NET_WM_WINDOW_TYPE_DESKTOP"
+	WindowTypeDock         WindowType = "_NET_WM_WINDOW_TYPE_DOCK"
+	WindowTypeToolbar      WindowType = "_NET_WM_WINDOW_TYPE_TOOLBAR"
+	WindowTypeMenu         WindowType = "_NET_WM_WINDOW_TYPE_MENU"
+	WindowTypeUtility      WindowType = "_NET_WM_WINDOW_TYPE_UTILITY"
+	WindowTypeSplash       WindowType = "_NET_WM_WINDOW_TYPE_SPLASH"
+	WindowTypeDialog       WindowType = "_NET_WM_WINDOW_TYPE_DIALOG"
+	WindowTypeDropdownMenu WindowType = "_NET_WM_WINDOW_TYPE_DROPDOWN_MENU"
+	WindowTypePopupMenu    WindowType = "_NET_WM_WINDOW_TYPE_POPUP_MENU"
+	WindowTypeTooltip      WindowType = "_NET_WM_WINDOW_TYPE_TOOLTIP"
+	WindowTypeNotification WindowType = "_NET_WM_WINDOW_TYPE_NOTIFICATION"
+	WindowTypeCombo        WindowType = "_NET_WM_WINDOW_TYPE_COMBO"
+	WindowTypeDnd          WindowType = "_NET_WM_WINDOW_TYPE_DND"
+	WindowTypeNormal       WindowType = "_NET_WM_WINDOW_TYPE_NORMAL"
 )
 
-const WindowBorderWidth = 4
-const WindowBorderColor = 0x772277
-const WindowBorderActiveColor = 0xFF00FF
-
-func AddWindowBorder(x *xgb.Conn, w xproto.Window) error {
-	xproto.ChangeWindowAttributesChecked(x, w, xproto.CwBorderPixel, []uint32{WindowBorderColor})
-	return xproto.ConfigureWindowChecked(x, w, xproto.ConfigWindowBorderWidth, []uint32{WindowBorderWidth}).Check()
-}
-
-func RemoveWindowBorder(x *xgb.Conn, w xproto.Window) error {
-	xproto.ChangeWindowAttributesChecked(x, w, xproto.CwBorderPixel, []uint32{0x000000})
-	return xproto.ConfigureWindowChecked(x, w, xproto.ConfigWindowBorderWidth, []uint32{0}).Check()
-}
-
-func SetWindowBorderColor(x *xgb.Conn, w xproto.Window, color uint32) error {
-	return xproto.ChangeWindowAttributesChecked(x, w, xproto.CwBorderPixel, []uint32{color}).Check()
-}
-
-func RaiseWindow(x *xgb.Conn, w xproto.Window) error {
-	return xproto.ConfigureWindowChecked(x, w, xproto.ConfigWindowStackMode, []uint32{xproto.StackModeAbove}).Check()
-}
-
-func FocusedWindow(x *xgb.Conn) (xproto.Window, error) {
-	if err := xproto.GrabServerChecked(x).Check(); err != nil {
-		return 0, err
+func (w WindowType) String() string {
+	switch w {
+	case WindowTypeDesktop:
+		return "Desktop"
+	case WindowTypeDock:
+		return "Dock"
+	case WindowTypeToolbar:
+		return "Toolbar"
+	case WindowTypeMenu:
+		return "Menu"
+	case WindowTypeUtility:
+		return "Utility"
+	case WindowTypeSplash:
+		return "Splash"
+	case WindowTypeDialog:
+		return "Dialog"
+	case WindowTypeDropdownMenu:
+		return "DropdownMenu"
+	case WindowTypePopupMenu:
+		return "PopupMenu"
+	case WindowTypeTooltip:
+		return "Tooltip"
+	case WindowTypeNotification:
+		return "Notification"
+	case WindowTypeCombo:
+		return "Combo"
+	case WindowTypeDnd:
+		return "Dnd"
+	case WindowTypeNormal:
+		return "Normal"
 	}
-	defer xproto.UngrabServer(x)
+	return string(w)
+}
 
-	active, err := xproto.GetInputFocus(x).Reply()
+func getWindowTypes(w xproto.Window) []WindowType {
+	reply, err := xprops.GetPropName(w, "_NET_WM_WINDOW_TYPE")
 	if err != nil {
-		return 0, err
+		return nil
 	}
 
-	window := active.Focus
-
-	for {
-		reply, err := xproto.QueryTree(x, window).Reply()
+	atoms, err := xprop.PropValAtoms(xprops, reply)
+	if err != nil {
+		return nil
+	}
+	var types []WindowType
+	for _, atom := range atoms {
+		reply, err := xproto.GetAtomName(x, atom)
 		if err != nil {
-			return 0, err
+			continue
 		}
-		if reply.Root == window || reply.Parent == reply.Root {
-			break
-		} else {
-			window = reply.Parent
-		}
+		types = append(types, WindowType(reply.Name))
 	}
 
-	return active.Focus, nil
+	return types
 }
 
-func FocusWindow(x *xgb.Conn, w xproto.Window) error {
-	return xproto.SetInputFocusChecked(x, xproto.InputFocusPointerRoot, w, xproto.TimeCurrentTime).Check()
+func doesWindowHaveType(w xproto.Window, types ...WindowType) bool {
+	wtypes := getWindowTypes(w)
+	for _, wtype := range wtypes {
+		for _, t := range types {
+			if wtype == t {
+				return true
+			}
+		}
+	}
+	return false
 }
 
-func WindowGeometry(x *xgb.Conn, w xproto.Window) (int16, int16, uint16, uint16, error) {
-	geo, err := xproto.GetGeometry(x, xproto.Drawable(w)).Reply()
+func getWindowName(w xproto.Window) (string, error) {
+	name, err := eccmName(w)
 	if err != nil {
-		return 0, 0, 0, 0, err
+		return name, nil
 	}
-	return geo.X, geo.Y, geo.Width, geo.Height, nil
+	name, err = icccm.WmNameGet(xprops, w)
+	if err == nil {
+		return name, nil
+	}
+	return "", err
 }
 
-func RegisterToWindow(x *xgb.Conn, w xproto.Window) error {
-	return xproto.ChangeWindowAttributes(x, w, xproto.CwEventMask, []uint32{xproto.EventMaskPointerMotion}).Check()
+func getWindowClass(w xproto.Window) (string, string, error) {
+	class, err := icccm.WmClassGet(xprops, w)
+	if err != nil {
+		return "", "", err
+	}
+	return class.Instance, class.Class, nil
 }
 
-func UnregisterFromWindow(x *xgb.Conn, w xproto.Window) error {
-	return xproto.ChangeWindowAttributes(x, w, xproto.CwEventMask, []uint32{xproto.EventMaskNoEvent}).Check()
+func getWindowGroup(w xproto.Window) xproto.Window {
+	hints, err := icccm.WmHintsGet(xprops, w)
+	if err != nil {
+		return 0
+	}
+	return hints.WindowGroup
 }
 
-func ParentWindow(x *xgb.Conn, w xproto.Window) error {
-	// TODO: Create a new window, get the target window's geom, resize new window to fit window geom + our border, then reparent target window to new window.
-	return nil
+func hasHints(w xproto.Window) bool {
+	_, err := icccm.WmHintsGet(xprops, w)
+	return err == nil
 }
 
-func UnparentWindow(x *xgb.Conn, w xproto.Window) error {
-	// TODO: Reparent window to root, then destroy owning window.
-	return nil
+func getWindowHints(w xproto.Window) *icccm.Hints {
+	hints, err := icccm.WmHintsGet(xprops, w)
+	if err != nil {
+		return nil
+	}
+	return hints
 }
 
-func Cleanup(x *xgb.Conn, root xproto.Window) {
-	if tree, err := xproto.QueryTree(x, root).Reply(); err == nil {
-		for _, child := range tree.Children {
-			RemoveWindowBorder(x, child)
+func getWindow(w xproto.Window) *Window {
+	for _, window := range windows {
+		if window.container == w {
+			return window
 		}
 	}
+	return nil
+}
+
+func tryAdopt(w xproto.Window) bool {
+	if _, _, err := getWindowClass(w); err != nil {
+		return false
+	}
+
+	if doesWindowHaveType(w, WindowTypePopupMenu, WindowTypeDialog, WindowTypeDropdownMenu) {
+		return false
+	}
+
+	for _, window := range windows {
+		if window.target == w || window.container == w {
+			return false
+		}
+	}
+
+	container, err := CreateWindowWrapper(w)
+	if err != nil {
+		fmt.Println("failed to create container for window", w)
+		return false
+	}
+
+	if err := xproto.MapWindow(x, container); err != nil {
+		fmt.Println("failed to map container for window", w)
+		return false
+	}
+
+	if err := xproto.ReparentWindow(x, w, container, 0, 0); err != nil {
+		fmt.Println("failed to reparent window", w)
+		xproto.DestroyWindow(x, container)
+		return false
+	}
+
+	windows = append(windows, &Window{target: w, container: container})
+
+	return true
+}
+
+func tryDisown(w xproto.Window, remap bool) bool {
+	for i, window := range windows {
+		if window.target == w {
+			if remap {
+				xproto.ReparentWindow(x, window.target, root, 0, 0)
+			}
+			xproto.DestroyWindow(x, window.container)
+			windows = append(windows[:i], windows[i+1:]...)
+			fmt.Println("destroyed")
+			return true
+		}
+	}
+	return false
 }
 
 func main() {
-	var x *xgb.Conn
 	var err error
-	if x, err = xgb.NewConn(); err != nil {
+	var buf []byte
+	if x, buf, err = xgb.Dial(""); err != nil {
 		panic(err)
 	}
 
-	setup := xproto.Setup(x)
-	root := setup.DefaultScreen(x).Root
+	setup, err := xproto.Setup(x, buf)
+	if err != nil {
+		panic(err)
+	}
 
-	if err := xproto.ChangeWindowAttributesChecked(x, root, xproto.CwEventMask, []uint32{xproto.EventMaskButtonPress | xproto.EventMaskButtonRelease | xproto.EventMaskButton1Motion | xproto.EventMaskButton3Motion | xproto.EventMaskSubstructureNotify | xproto.EventMaskFocusChange}).Check(); err != nil {
+	screen = setup.Roots[0]
+
+	root = setup.Roots[0].Root
+
+	xprops = &xprop.XPropConn{XConn: x}
+
+	// Add hints to our root window.
+	nameAtom, _ := xprops.Atom("_NET_WM_NAME", false)
+	windowTypeAtom, _ := xprops.Atom("_NET_WM_WINDOW_TYPE", false)
+	var supportedAtoms = []xproto.Atom{
+		nameAtom,
+		windowTypeAtom,
+	}
+
+	supportedData := make([]uint8, len(supportedAtoms)*4)
+	for i, atom := range supportedAtoms {
+		into := supportedData[i*4:]
+		binary.LittleEndian.PutUint32(into, uint32(atom))
+	}
+
+	if err := xprops.ChangePropName(root, 32, "_NET_SUPPORTED", "ATOM", supportedData); err != nil {
 		panic(err)
 	}
 
 	// Add borders to all our windows.
-	if tree, err := xproto.QueryTree(x, root).Reply(); err == nil {
-		for _, child := range tree.Children {
-			if err := AddWindowBorder(x, child); err != nil {
-				fmt.Println(err)
-			}
-		}
+	tree, err := xproto.QueryTree(x, root)
+	if err != nil {
+		panic(err)
+	}
+	for _, child := range tree.Children {
+		tryAdopt(child)
 	}
 
 	// Ensure we clean up our windows when we exit.
 	defer func() {
-		if recover() != nil {
-			Cleanup(x, root)
+		cleanup()
+		if r := recover(); r != nil {
+			panic(r)
 		}
 	}()
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt)
 	go func() {
 		for range c {
-			Cleanup(x, root)
+			cleanup()
 			os.Exit(0)
 		}
 	}()
 
-	// Get the focused window and set its border color.
-	focusedWindow, err := FocusedWindow(x)
-	if err != nil {
-		fmt.Println("couldn't get focused window", err)
-	} else {
-		SetWindowBorderColor(x, focusedWindow, WindowBorderActiveColor)
+	// Get structure eventies.
+
+	if err := xproto.ChangeWindowAttributes(x, root, xproto.CwEventMask, []uint32{xproto.EventMaskSubstructureNotify | xproto.ButtonPress}); err != nil {
+		panic(err)
 	}
 
-	var window xproto.Window
-	var windowX, windowY int16
-	var windowWidth, windowHeight uint16
-	var moved bool
-	var startX, startY int16
-	var action WindowAction
 	for {
-		var ev xgb.Event
-		if ev, err = x.WaitForEvent(); err != nil {
+		ev, err := x.Recv()
+		if err != nil {
 			panic(err)
 		}
 		switch ev := ev.(type) {
-		case xproto.ButtonPressEvent:
-			// Get our window's starting X and Y.
-			windowX, windowY, windowWidth, windowHeight, err = WindowGeometry(x, ev.Child)
+		case *xproto.ButtonPressEvent:
+			fmt.Printf("%+v\n", ev)
+			for _, w := range windows {
+				fmt.Println(w.container, w.target)
+			}
+			if w := getWindow(ev.Event); w != nil {
+				w.onPress(int(ev.Detail), int(ev.EventX), int(ev.EventY), uint32(ev.Time))
+			}
+		case *xproto.ButtonReleaseEvent:
+			if w := getWindow(ev.Event); w != nil {
+				w.onRelease(int(ev.Detail), int(ev.EventX), int(ev.EventY), uint32(ev.Time))
+			}
+		case *xproto.MotionNotifyEvent:
+			if w := getWindow(ev.Event); w != nil {
+				w.onMotion(int(ev.EventX), int(ev.EventY), uint32(ev.Time))
+			}
+		case *xproto.UnmapNotifyEvent:
+			fmt.Println("unmap notify", ev)
+		case *xproto.DestroyNotifyEvent:
+			fmt.Println("destroy notify", ev, ev.Event, ev.Window)
+			tryDisown(ev.Window, false)
+		case *xproto.CreateNotifyEvent:
+			fmt.Println("create notify", ev, ev.BorderWidth, ev.OverrideRedirect, ev.Width, ev.Height, ev.X, ev.Y)
+		case *xproto.ConfigureRequestEvent:
+			fmt.Println("configure request", ev)
+		case *xproto.MapNotifyEvent:
+			fmt.Println("map notify", ev)
+			tryAdopt(ev.Window)
+		case *xproto.ConfigureNotifyEvent:
+			fmt.Println("configure notify", ev)
+		case *xproto.ReparentNotifyEvent:
+			fmt.Println("reparent notify", ev)
+		case *xproto.ClientMessageEvent:
+			fmt.Println("client message", ev)
+			reply, err := xproto.GetAtomName(x, ev.Type)
 			if err != nil {
-				continue
+				fmt.Println("unknown atom", ev.Type)
 			}
-			startX = ev.RootX
-			startY = ev.RootY
-			window = ev.Child
-			if ev.Detail == 1 {
-				action = WindowActionMove
-				moved = false
-			} else if ev.Detail == 3 {
-				action = WindowActionResize
-			}
-		case xproto.ButtonReleaseEvent:
-			if !moved {
-				SetWindowBorderColor(x, focusedWindow, WindowBorderColor)
-				RaiseWindow(x, window)
-				focusedWindow = window
-				SetWindowBorderColor(x, focusedWindow, WindowBorderActiveColor)
-				if err := FocusWindow(x, window); err != nil {
-					fmt.Println("couldn't focus window", err)
-				}
-			}
-			action = WindowActionNone
-		case xproto.MotionNotifyEvent:
-			if action == WindowActionMove {
-				dx := ev.RootX - startX
-				dy := ev.RootY - startY
-				xproto.ConfigureWindow(x, window, xproto.ConfigWindowX|xproto.ConfigWindowY, []uint32{uint32(windowX + dx), uint32(windowY + dy)})
-				moved = true
-			} else if action == WindowActionResize {
-				dx := ev.RootX - startX
-				dy := ev.RootY - startY
-				xproto.ConfigureWindow(x, window, xproto.ConfigWindowWidth|xproto.ConfigWindowHeight, []uint32{uint32(int16(windowWidth) + dx), uint32(int16(windowHeight) + dy)})
-			}
-		case xproto.CreateNotifyEvent:
-			if err := AddWindowBorder(x, ev.Window); err != nil {
-				fmt.Println(err)
-			}
-		case xproto.DestroyNotifyEvent:
-			if err := RemoveWindowBorder(x, ev.Window); err != nil {
-				fmt.Println(err)
-			}
-			if ev.Window == focusedWindow {
-				// TODO: Set focused to last focused window.
-			}
-		case xproto.FocusInEvent:
-			fmt.Println("focus in", ev.Event)
-		case xproto.FocusOutEvent:
-			fmt.Println("focus out", ev.Event)
+			fmt.Println("client atom", reply.Name)
 		default:
-			fmt.Println("unhandled", ev)
+			fmt.Println("unknown event", ev)
 		}
 	}
 }
