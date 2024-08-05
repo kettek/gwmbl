@@ -22,13 +22,7 @@ var movingWindow xproto.Window
 
 func cleanup() {
 	for _, w := range windows {
-		var px, py int16
-		geo, err := xproto.GetGeometry(x, xproto.Drawable(w.container))
-		if err == nil {
-			px = geo.X
-			py = geo.Y
-		}
-		xproto.ReparentWindowUnchecked(x, w.target, root, px, py)
+		xproto.ReparentWindowUnchecked(x, w.target, root, w.lastX, w.lastY)
 		xproto.DestroyWindowUnchecked(x, w.container)
 	}
 }
@@ -169,9 +163,17 @@ func getWindowHints(w xproto.Window) *icccm.Hints {
 	return hints
 }
 
+func isWindowTransient(w xproto.Window) (xproto.Window, bool) {
+	win, err := icccm.WmTransientForGet(xprops, w)
+	if err != nil {
+		return 0, false
+	}
+	return win, true
+}
+
 func getWindow(w xproto.Window) *Window {
 	for _, window := range windows {
-		if window.container == w {
+		if window.container == w || window.target == w {
 			return window
 		}
 	}
@@ -180,6 +182,11 @@ func getWindow(w xproto.Window) *Window {
 
 func tryAdopt(w xproto.Window) bool {
 	if _, _, err := getWindowClass(w); err != nil {
+		return false
+	}
+
+	// FIXME: Is it correct to ignore transient windows?
+	if _, ok := isWindowTransient(w); ok {
 		return false
 	}
 
@@ -193,24 +200,28 @@ func tryAdopt(w xproto.Window) bool {
 		}
 	}
 
-	container, err := CreateWindowWrapper(w)
+	window, err := CreateWindowWrapper(w)
 	if err != nil {
 		fmt.Println("failed to create container for window", w)
 		return false
 	}
 
-	if err := xproto.MapWindow(x, container); err != nil {
+	if err := xproto.MapWindow(x, window.container); err != nil {
 		fmt.Println("failed to map container for window", w)
 		return false
 	}
 
-	if err := xproto.ReparentWindow(x, w, container, 0, 0); err != nil {
+	if err := xproto.ReparentWindow(x, w, window.container, 0, 0); err != nil {
 		fmt.Println("failed to reparent window", w)
-		xproto.DestroyWindow(x, container)
+		xproto.DestroyWindow(x, window.container)
 		return false
 	}
 
-	windows = append(windows, &Window{target: w, container: container})
+	if err := xproto.GrabButton(x, true, window.container, xproto.EventMaskButtonPress, xproto.GrabModeSync, xproto.GrabModeAsync, root, xproto.CursorNone, xproto.ButtonIndex1, xproto.ButtonMaskAny); err != nil {
+		fmt.Println("failed to grab button", err)
+	}
+
+	windows = append(windows, window)
 
 	return true
 }
@@ -219,11 +230,10 @@ func tryDisown(w xproto.Window, remap bool) bool {
 	for i, window := range windows {
 		if window.target == w {
 			if remap {
-				xproto.ReparentWindow(x, window.target, root, 0, 0)
+				xproto.ReparentWindowUnchecked(x, window.target, root, 0, 0)
 			}
-			xproto.DestroyWindow(x, window.container)
+			xproto.DestroyWindowUnchecked(x, window.container)
 			windows = append(windows[:i], windows[i+1:]...)
-			fmt.Println("destroyed")
 			return true
 		}
 	}
@@ -293,7 +303,7 @@ func main() {
 
 	// Get structure eventies.
 
-	if err := xproto.ChangeWindowAttributes(x, root, xproto.CwEventMask, []uint32{xproto.EventMaskSubstructureNotify | xproto.ButtonPress}); err != nil {
+	if err := xproto.ChangeWindowAttributes(x, root, xproto.CwEventMask, []uint32{xproto.EventMaskSubstructureNotify | xproto.EventMaskButtonPress | xproto.EventMaskButtonRelease | xproto.EventMaskButtonMotion | xproto.EventMaskFocusChange | xproto.EventMaskEnterWindow | xproto.EventMaskLeaveWindow}); err != nil {
 		panic(err)
 	}
 
@@ -304,35 +314,46 @@ func main() {
 		}
 		switch ev := ev.(type) {
 		case *xproto.ButtonPressEvent:
-			fmt.Printf("%+v\n", ev)
-			for _, w := range windows {
-				fmt.Println(w.container, w.target)
-			}
 			if w := getWindow(ev.Event); w != nil {
-				w.onPress(int(ev.Detail), int(ev.EventX), int(ev.EventY), uint32(ev.Time))
+				xproto.SetInputFocus(x, xproto.InputFocusParent, w.target, xproto.TimeCurrentTime)
+				if ev.Child != 0 { // Our contents were hit -- just raise the window.
+					w.raise()
+				} else { // Otherwise handle as a press!
+					w.onPress(int(ev.Detail), ev.RootX, ev.RootY, uint32(ev.Time))
+				}
+			} else {
+				xproto.SetInputFocus(x, xproto.InputFocusNone, ev.Event, xproto.TimeCurrentTime)
 			}
+			xproto.AllowEvents(x, xproto.AllowReplayPointer, ev.Time)
 		case *xproto.ButtonReleaseEvent:
 			if w := getWindow(ev.Event); w != nil {
-				w.onRelease(int(ev.Detail), int(ev.EventX), int(ev.EventY), uint32(ev.Time))
+				w.onRelease(int(ev.Detail), ev.RootX, ev.RootY, uint32(ev.Time))
 			}
 		case *xproto.MotionNotifyEvent:
 			if w := getWindow(ev.Event); w != nil {
-				w.onMotion(int(ev.EventX), int(ev.EventY), uint32(ev.Time))
+				w.onMotion(ev.RootX, ev.RootY, uint32(ev.Time))
 			}
+		case *xproto.FocusInEvent:
+			fmt.Println("focus in", ev)
+		case *xproto.FocusOutEvent:
+			fmt.Println("focus out", ev)
 		case *xproto.UnmapNotifyEvent:
 			fmt.Println("unmap notify", ev)
 		case *xproto.DestroyNotifyEvent:
-			fmt.Println("destroy notify", ev, ev.Event, ev.Window)
 			tryDisown(ev.Window, false)
 		case *xproto.CreateNotifyEvent:
 			fmt.Println("create notify", ev, ev.BorderWidth, ev.OverrideRedirect, ev.Width, ev.Height, ev.X, ev.Y)
 		case *xproto.ConfigureRequestEvent:
 			fmt.Println("configure request", ev)
 		case *xproto.MapNotifyEvent:
-			fmt.Println("map notify", ev)
 			tryAdopt(ev.Window)
 		case *xproto.ConfigureNotifyEvent:
-			fmt.Println("configure notify", ev)
+			fmt.Println("configure notify", ev.Event, ev.Window, ev.Width, ev.Height, ev.X, ev.Y)
+			if w := getWindow(ev.Window); w != nil {
+				if ev.X != 0 || ev.Y != 0 {
+					xproto.ConfigureWindowUnchecked(x, w.target, xproto.ConfigWindowX|xproto.ConfigWindowY, []uint32{0, 0})
+				}
+			}
 		case *xproto.ReparentNotifyEvent:
 			fmt.Println("reparent notify", ev)
 		case *xproto.ClientMessageEvent:
@@ -342,6 +363,10 @@ func main() {
 				fmt.Println("unknown atom", ev.Type)
 			}
 			fmt.Println("client atom", reply.Name)
+		case *xproto.EnterNotifyEvent:
+			fmt.Println("enter notify", ev)
+		case *xproto.LeaveNotifyEvent:
+			fmt.Println("leave notify", ev)
 		default:
 			fmt.Println("unknown event", ev)
 		}
